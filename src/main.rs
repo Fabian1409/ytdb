@@ -1,8 +1,9 @@
 use anyhow::Result;
 use clap::{arg, command};
 use image::open;
+use rayon::prelude::*;
 use std::{
-    fs::{self, read_to_string},
+    fs::{self, read_to_string, remove_file},
     process::{Command, Stdio},
 };
 use tempfile::tempdir;
@@ -42,54 +43,59 @@ fn main() -> Result<()> {
                 .spawn()?;
             ffmpeg.wait()?;
 
-            let mut bytes = Vec::new();
+            let mut bytes: Vec<Vec<u8>> = Vec::new();
 
             let mut frames: Vec<_> = fs::read_dir(dir.path().to_str().unwrap().to_owned() + "/")?
                 .map(|f| f.unwrap())
                 .collect();
-            frames.sort_by_key(|dir| dir.path());
+            frames.reverse();
 
-            for file in frames {
-                let mut x = 0u32;
-                let mut y = 0u32;
-                let img = open(file.path()).unwrap().into_rgba8();
-                loop {
-                    let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
-                    for xp in x..x + N_PIXEL {
-                        for yp in y..y + N_PIXEL {
-                            let pixel = img.get_pixel(xp, yp);
-                            r += *pixel.0.first().unwrap() as u32;
-                            g += *pixel.0.get(1).unwrap() as u32;
-                            b += *pixel.0.get(2).unwrap() as u32;
+            frames
+                .into_par_iter()
+                .map(|file| {
+                    let mut x = 0u32;
+                    let mut y = 0u32;
+                    let img = open(file.path()).unwrap().into_rgba8();
+                    let mut frame_bytes = vec![];
+                    loop {
+                        let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+                        for xp in x..x + N_PIXEL {
+                            for yp in y..y + N_PIXEL {
+                                let pixel = img.get_pixel(xp, yp);
+                                r += *pixel.0.first().unwrap() as u32;
+                                g += *pixel.0.get(1).unwrap() as u32;
+                                b += *pixel.0.get(2).unwrap() as u32;
+                            }
+                        }
+
+                        r /= N_PIXEL * N_PIXEL;
+                        g /= N_PIXEL * N_PIXEL;
+                        b /= N_PIXEL * N_PIXEL;
+
+                        frame_bytes.push(r as u8);
+                        frame_bytes.push(g as u8);
+                        frame_bytes.push(b as u8);
+
+                        if (r == 0) | (g == 0) | (b == 0) {
+                            break;
+                        }
+
+                        x += N_PIXEL;
+
+                        if x == WIDTH {
+                            x = 0;
+                            y += N_PIXEL;
+                        }
+
+                        if y == HEIGHT {
+                            break;
                         }
                     }
+                    frame_bytes
+                })
+                .collect_into_vec(&mut bytes);
 
-                    r /= N_PIXEL * N_PIXEL;
-                    g /= N_PIXEL * N_PIXEL;
-                    b /= N_PIXEL * N_PIXEL;
-
-                    bytes.push(r as u8);
-                    bytes.push(g as u8);
-                    bytes.push(b as u8);
-
-                    if (r == 0) | (g == 0) | (b == 0) {
-                        break;
-                    }
-
-                    x += N_PIXEL;
-
-                    if x == WIDTH {
-                        x = 0;
-                        y += N_PIXEL;
-                    }
-
-                    if y == HEIGHT {
-                        break;
-                    }
-                }
-            }
-
-            let value = String::from_utf8(bytes)?;
+            let value = String::from_utf8(bytes.into_iter().flatten().collect())?;
             fs::write(format!("{key}.txt"), value)?;
             // println!("{value}");
         }
@@ -108,42 +114,36 @@ fn main() -> Result<()> {
             let padding = 3 - bytes.len() % 3;
             bytes.resize(bytes.len() + padding, 0);
 
-            let mut frame = 1;
+            bytes
+                .par_chunks(((HEIGHT * WIDTH * 3) / (N_PIXEL * N_PIXEL)) as usize)
+                .enumerate()
+                .for_each(|(i, frame)| {
+                    let mut img = image::ImageBuffer::new(WIDTH, HEIGHT);
+                    let mut x = 0u32;
+                    let mut y = 0u32;
+                    for chunk in frame.chunks_exact(3) {
+                        let r = chunk[0];
+                        let g = chunk[1];
+                        let b = chunk[2];
 
-            let mut img = image::ImageBuffer::new(WIDTH, HEIGHT);
+                        for xp in x..x + N_PIXEL {
+                            for yp in y..y + N_PIXEL {
+                                img.put_pixel(xp, yp, image::Rgb([r, g, b]));
+                            }
+                        }
 
-            let mut x = 0u32;
-            let mut y = 0u32;
+                        x += N_PIXEL;
 
-            for chunk in bytes.chunks_exact(3) {
-                let r = chunk[0];
-                let g = chunk[1];
-                let b = chunk[2];
-
-                for xp in x..x + N_PIXEL {
-                    for yp in y..y + N_PIXEL {
-                        img.put_pixel(xp, yp, image::Rgb([r, g, b]));
+                        if x == WIDTH {
+                            x = 0;
+                            y += N_PIXEL;
+                        }
                     }
-                }
-
-                x += N_PIXEL;
-
-                if x == WIDTH {
-                    x = 0;
-                    y += N_PIXEL;
-                }
-
-                if y == HEIGHT {
-                    img.save(format!("{}/{frame}.png", dir.path().to_str().unwrap()))
+                    img.save(format!("{}/{}.png", dir.path().to_str().unwrap(), i + 1))
                         .unwrap();
-                    img = image::ImageBuffer::new(WIDTH, HEIGHT);
-                    x = 0;
-                    y = 0;
-                    frame += 1;
-                }
-            }
-            img.save(format!("{}/{frame}.png", dir.path().to_str().unwrap()))
-                .unwrap();
+                });
+
+            let _ = remove_file(format!("{key}.mp4"));
 
             // ffmpeg -framerate 30 -i key_%d.png -c:v libx264rgb -crf 0 -r 30 output.mp4
             let mut ffmpeg = Command::new("ffmpeg")
